@@ -1,0 +1,69 @@
+name: Windows 10 Cloud PC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Enables Remote Desktop on the GitHub runner machine
+      - name: Enable RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+        shell: powershell
+
+      # Sets the password for the default runner account
+      - name: Set RDP Password
+        run: |
+          $username = $env:USERNAME
+          net user $username "CloudPC@2024!"
+          Write-Host "RDP Username: $username"
+        shell: powershell
+
+      # Installs ngrok via Chocolatey (pre-installed on GitHub runners)
+      - name: Install ngrok
+        run: choco install ngrok -y
+        shell: powershell
+
+      # Authenticates ngrok with your token stored in GitHub Secrets
+      - name: Authenticate ngrok
+        run: ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
+        shell: powershell
+
+      # Opens a TCP tunnel on port 3389 (RDP port) in the background
+      - name: Start ngrok Tunnel
+        run: Start-Process ngrok -ArgumentList "tcp 3389" -NoNewWindow
+        shell: powershell
+
+      # Waits for ngrok to fully initialize before reading the URL
+      - name: Wait For Tunnel
+        run: Start-Sleep -Seconds 8
+        shell: powershell
+
+      # Reads the tunnel URL from ngrok's local API and prints it to logs
+      - name: Get Connection Address
+        run: |
+          $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels"
+          $url = $response.tunnels[0].public_url
+          $clean = $url -replace "tcp://", ""
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  CONNECT TO THIS ADDRESS IN RDP:"
+          Write-Host "  $clean"
+          Write-Host "=========================================="
+          Write-Host ""
+        shell: powershell
+
+      # Keeps the workflow alive for 6 hours (360 minutes = GitHub's max)
+      - name: Keep Session Alive
+        run: Start-Sleep -Seconds 21600
+        shell: powershell
