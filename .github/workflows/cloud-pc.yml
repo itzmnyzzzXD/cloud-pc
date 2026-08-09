@@ -13,57 +13,99 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Enables Remote Desktop on the GitHub runner machine
-      - name: Enable RDP
+      # High performance power plan + disable sleep/screensaver
+      - name: Optimize System Performance
+        run: |
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+          reg add "HKCU\Control Panel\Desktop" /v ScreenSaveActive /t REG_SZ /d 0 /f
+        shell: powershell
+
+      # Disable Windows Update + Defender real-time scan during session
+      - name: Disable Background Interference
+        run: |
+          Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+          Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+        shell: powershell
+
+      # Enable RDP + set password in one shot
+      - name: Enable RDP & Set Credentials
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          net user $env:USERNAME "CloudPC@2024!"
+          Write-Host "RDP ready — user: $env:USERNAME"
         shell: powershell
 
-      # Sets the password for the default runner account
-      - name: Set RDP Password
+      # Direct binary download — skips Chocolatey entirely, saves ~45 seconds
+      - name: Download & Authenticate ngrok
         run: |
-          $username = $env:USERNAME
-          net user $username "CloudPC@2024!"
-          Write-Host "RDP Username: $username"
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "ngrok.zip"
+          Expand-Archive -Path "ngrok.zip" -DestinationPath "C:\ngrok" -Force
+          C:\ngrok\ngrok.exe config add-authtoken ${{ secrets.NGROK_TOKEN }}
         shell: powershell
 
-      # Installs ngrok via Chocolatey (pre-installed on GitHub runners)
-      - name: Install ngrok
-        run: choco install ngrok -y
-        shell: powershell
-
-      # Authenticates ngrok with your token stored in GitHub Secrets
-      - name: Authenticate ngrok
-        run: ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
-        shell: powershell
-
-      # Opens a TCP tunnel on port 3389 (RDP port) in the background
-      - name: Start ngrok Tunnel
-        run: Start-Process ngrok -ArgumentList "tcp 3389" -NoNewWindow
-        shell: powershell
-
-      # Waits for ngrok to fully initialize before reading the URL
-      - name: Wait For Tunnel
-        run: Start-Sleep -Seconds 8
-        shell: powershell
-
-      # Reads the tunnel URL from ngrok's local API and prints it to logs
-      - name: Get Connection Address
+      # Start tunnel + poll until ready with 2s intervals
+      - name: Start Tunnel & Print Address
         run: |
-          $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels"
-          $url = $response.tunnels[0].public_url
-          $clean = $url -replace "tcp://", ""
-          Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "  CONNECT TO THIS ADDRESS IN RDP:"
-          Write-Host "  $clean"
-          Write-Host "=========================================="
-          Write-Host ""
+          Start-Process "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -NoNewWindow -RedirectStandardOutput "C:\ngrok\ngrok.log"
+          
+          $url = $null
+          $attempts = 0
+          while (-not $url -and $attempts -lt 30) {
+            Start-Sleep -Seconds 2
+            try {
+              $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+              if ($response.tunnels.Count -gt 0) {
+                $url = $response.tunnels[0].public_url
+              }
+            } catch {
+              $attempts++
+              Write-Host "Starting tunnel... ($attempts/30)"
+            }
+          }
+
+          if ($url) {
+            $clean = $url -replace "tcp://", ""
+            $host_part = $clean.Split(":")[0]
+            $port_part = $clean.Split(":")[1]
+            Write-Host ""
+            Write-Host "=========================================="
+            Write-Host "  RDP ADDRESS : $host_part"
+            Write-Host "  RDP PORT    : $port_part"
+            Write-Host "  USERNAME    : $env:USERNAME"
+            Write-Host "  PASSWORD    : CloudPC@2024!"
+            Write-Host "=========================================="
+          } else {
+            Write-Host "ERROR: Tunnel failed to initialize"
+            Get-Content "C:\ngrok\ngrok.log" -Tail 20
+            exit 1
+          }
         shell: powershell
 
-      # Keeps the workflow alive for 6 hours (360 minutes = GitHub's max)
-      - name: Keep Session Alive
-        run: Start-Sleep -Seconds 21600
+      # Keep alive with health check every 60s — restarts ngrok if tunnel drops
+      - name: Keep Alive With Health Check
+        run: |
+          $end = (Get-Date).AddSeconds(21000)
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+            try {
+              $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+              if ($response.tunnels.Count -eq 0) {
+                Write-Host "Tunnel dropped — restarting ngrok"
+                Start-Process "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -NoNewWindow
+                Start-Sleep -Seconds 5
+                $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+                $url = $response.tunnels[0].public_url -replace "tcp://", ""
+                Write-Host "Tunnel restored: $url"
+              }
+            } catch {
+              Write-Host "Health check failed — ngrok may be down"
+            }
+          }
         shell: powershell
