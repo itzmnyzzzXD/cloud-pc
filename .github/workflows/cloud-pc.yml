@@ -1,4 +1,5 @@
 name: CI
+name: CI
 
 on:
   push:
@@ -12,7 +13,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-
       - name: Download ngrok
         run: |
           Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "C:\ngrok.zip"
@@ -21,7 +21,10 @@ jobs:
         shell: powershell
 
       - name: Auth
-        run: C:\ngrok\ngrok.exe config add-authtoken $env:NGROK_AUTH_TOKEN
+        run: |
+          $configDir = Join-Path $env:LOCALAPPDATA "ngrok"
+          if (!(Test-Path $configDir)) { New-Item -ItemType Directory -Path $configDir -Force | Out-Null }
+          C:\ngrok\ngrok.exe config add-authtoken $env:NGROK_AUTH_TOKEN
         shell: powershell
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
@@ -35,32 +38,44 @@ jobs:
           Write-Host "RDP ready"
         shell: powershell
 
-      - name: Start Tunnel
+      - name: Start Tunnel, Get Address & Keep Alive
         run: |
+          $outLog = "C:\ngrok_out.log"
+          $errLog = "C:\ngrok_err.log"
+
+          # Start ngrok with its OWN hidden window so it survives this step
           $proc = Start-Process `
             -FilePath "C:\ngrok\ngrok.exe" `
-            -ArgumentList @("tcp", "3389", "--log=C:\ngrok.log") `
-            -NoNewWindow -PassThru
-          Write-Host "PID: $($proc.Id)"
-          Start-Sleep -Seconds 10
+            -ArgumentList @("tcp", "3389") `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $outLog `
+            -RedirectStandardError $errLog
+
+          Write-Host "ngrok PID: $($proc.Id)"
+          Start-Sleep -Seconds 15
+
           if ($proc.HasExited) {
-            Write-Host "ngrok crashed — log:"
-            Get-Content C:\ngrok.log
+            Write-Host "ERROR: ngrok crashed immediately!"
+            Write-Host "--- stdout ---"; if (Test-Path $outLog) { Get-Content $outLog }
+            Write-Host "--- stderr ---"; if (Test-Path $errLog) { Get-Content $errLog }
             exit 1
           }
-          Write-Host "ngrok alive"
-        shell: powershell
 
-      - name: Get Address
-        run: |
+          # Poll the ngrok API for the public URL
           $url = $null
           for ($i = 1; $i -le 30; $i++) {
             Start-Sleep -Seconds 3
             try {
               $r = Invoke-RestMethod "http://localhost:4040/api/tunnels" -ErrorAction Stop
-              if ($r.tunnels.Count -gt 0) { $url = $r.tunnels[0].public_url; break }
-            } catch { Write-Host "Attempt $i/30" }
+              if ($r.tunnels.Count -gt 0) {
+                $url = $r.tunnels[0].public_url
+                break
+              }
+            } catch {
+              Write-Host "Attempt $i/30 - waiting for tunnel..."
+            }
           }
+
           if ($url) {
             $c = ($url -replace "tcp://","").Split(":")
             Write-Host ""
@@ -71,12 +86,13 @@ jobs:
             Write-Host " PASSWORD : P@ssw0rd!"
             Write-Host "================================"
           } else {
-            Write-Host "FAILED — full log:"
-            Get-Content C:\ngrok.log
+            Write-Host "FAILED: Could not retrieve tunnel URL."
+            Write-Host "--- stdout ---"; if (Test-Path $outLog) { Get-Content $outLog }
+            Write-Host "--- stderr ---"; if (Test-Path $errLog) { Get-Content $errLog }
             exit 1
           }
-        shell: powershell
 
-      - name: Keep Alive
-        run: Start-Sleep -Seconds 21600
+          # Keep the runner alive (and ngrok with it) for 6 hours max
+          Write-Host "Keeping alive..."
+          Start-Sleep -Seconds 21600
         shell: powershell
