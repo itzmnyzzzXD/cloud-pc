@@ -1,131 +1,36 @@
-name: Windows 10 Cloud PC
+name: CI
 
 on:
+  push:
+    branches:
+      - main  # Change this to your desired branch name
   workflow_dispatch:
 
 jobs:
   build:
+
     runs-on: windows-latest
-    timeout-minutes: 360
 
     steps:
+    - name: Download
+      run: Invoke-WebRequest https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-windows-amd64.zip -OutFile ngrok.zip
 
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+    - name: Extract
+      run: Expand-Archive ngrok.zip
 
-      - name: Optimize System Performance
-        run: |
-          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-          powercfg /change standby-timeout-ac 0
-          powercfg /change monitor-timeout-ac 0
-          powercfg /change hibernate-timeout-ac 0
-          reg add "HKCU\Control Panel\Desktop" /v ScreenSaveActive /t REG_SZ /d 0 /f
-        shell: powershell
+    - name: Auth
+      run: .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
+      env:
+        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
 
-      - name: Disable Background Interference
-        run: |
-          Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
-          Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
-          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
-        shell: powershell
+    - name: Enable TS
+      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
 
-      - name: Enable RDP & Set Credentials
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          net user $env:USERNAME "CloudPC@2024!"
-          Write-Host "RDP ready — user: $env:USERNAME"
-        shell: powershell
+    - run: Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Download ngrok
-        run: |
-          Invoke-WebRequest `
-            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
-            -OutFile "$env:TEMP\ngrok.zip"
-          Expand-Archive -Path "$env:TEMP\ngrok.zip" -DestinationPath "C:\ngrok" -Force
-          Write-Host "Binary exists: $(Test-Path 'C:\ngrok\ngrok.exe')"
-        shell: powershell
+    - run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
-      - name: Authenticate ngrok
-        run: |
-          C:\ngrok\ngrok.exe config add-authtoken ${{ secrets.NGROK_TOKEN }}
-          Write-Host "Token applied"
-        shell: powershell
+    - run: Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "P@ssw0rd!" -Force)
 
-      - name: Start Tunnel & Get Address
-        run: |
-          # Launch ngrok with debug logging and capture process object
-          $proc = Start-Process `
-            -FilePath "C:\ngrok\ngrok.exe" `
-            -ArgumentList "tcp 3389 --log=C:\ngrok\ngrok.log --log-level=debug" `
-            -NoNewWindow -PassThru
-
-          Write-Host "ngrok PID: $($proc.Id)"
-          Start-Sleep -Seconds 6
-
-          # Check if ngrok crashed immediately
-          if ($proc.HasExited) {
-            Write-Host "ERROR: ngrok crashed on startup"
-            Write-Host "--- ngrok log output ---"
-            Get-Content "C:\ngrok\ngrok.log" -ErrorAction SilentlyContinue
-            exit 1
-          }
-
-          Write-Host "ngrok process alive — polling API"
-
-          # Poll every 2 seconds, up to 30 attempts (60 seconds total)
-          $url = $null
-          $attempts = 0
-          while (-not $url -and $attempts -lt 30) {
-            Start-Sleep -Seconds 2
-            try {
-              $response = Invoke-RestMethod `
-                -Uri "http://localhost:4040/api/tunnels" `
-                -ErrorAction Stop
-              if ($response.tunnels.Count -gt 0) {
-                $url = $response.tunnels[0].public_url
-              }
-            } catch {
-              $attempts++
-              Write-Host "Waiting for tunnel API... ($attempts/30)"
-            }
-          }
-
-          if ($url) {
-            $clean  = $url -replace "tcp://", ""
-            $parts  = $clean.Split(":")
-            Write-Host ""
-            Write-Host "=========================================="
-            Write-Host "  RDP ADDRESS : $($parts[0])"
-            Write-Host "  RDP PORT    : $($parts[1])"
-            Write-Host "  USERNAME    : $env:USERNAME"
-            Write-Host "  PASSWORD    : CloudPC@2024!"
-            Write-Host "=========================================="
-          } else {
-            Write-Host "FAILED — tunnel never came up. ngrok log:"
-            Get-Content "C:\ngrok\ngrok.log" -Tail 40
-            exit 1
-          }
-        shell: powershell
-
-      - name: Keep Alive With Health Check
-        run: |
-          $end = (Get-Date).AddSeconds(21000)
-          while ((Get-Date) -lt $end) {
-            Start-Sleep -Seconds 60
-            try {
-              $r = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
-              if ($r.tunnels.Count -eq 0) {
-                Write-Host "Tunnel dropped — restarting ngrok"
-                Start-Process "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -NoNewWindow
-                Start-Sleep -Seconds 5
-                $r2 = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
-                Write-Host "Restored: $($r2.tunnels[0].public_url -replace 'tcp://','')"
-              }
-            } catch {
-              Write-Host "Health check miss — will retry in 60s"
-            }
-          }
-        shell: powershell
+    - name: Create Tunnel
+      run: .\ngrok\ngrok.exe tcp 3389
