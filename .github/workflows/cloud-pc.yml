@@ -13,42 +13,49 @@ jobs:
 
     steps:
 
-      - name: Download
-        run: Invoke-WebRequest https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-windows-amd64.zip -OutFile ngrok.zip
+      # v3 URL — the old 4VmDzA7iaHb URL is ngrok v2 and auth servers reject it
+      - name: Download ngrok
+        run: |
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "$env:TEMP\ngrok.zip"
+          Expand-Archive -Path "$env:TEMP\ngrok.zip" -DestinationPath "C:\ngrok" -Force
+          Write-Host "Binary ready: $(Test-Path 'C:\ngrok\ngrok.exe')"
         shell: powershell
 
-      - name: Extract
-        run: Expand-Archive ngrok.zip
-        shell: powershell
-
+      # v3 syntax is "config add-authtoken" not "authtoken"
       - name: Auth
-        run: .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
+        run: |
+          C:\ngrok\ngrok.exe config add-authtoken $Env:NGROK_AUTH_TOKEN
+          Write-Host "Auth applied"
         shell: powershell
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
 
-      - name: Enable TS
-        run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+      - name: Enable RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "P@ssw0rd!" -Force)
+          Write-Host "RDP enabled"
         shell: powershell
 
-      - name: Enable Firewall
-        run: Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+      # PassThru captures the process so we can check if it crashes
+      - name: Start Tunnel
+        run: |
+          $proc = Start-Process `
+            -FilePath "C:\ngrok\ngrok.exe" `
+            -ArgumentList "tcp 3389 --log=C:\ngrok\ngrok.log --log-level=debug" `
+            -NoNewWindow -PassThru
+          Write-Host "ngrok PID: $($proc.Id)"
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited) {
+            Write-Host "ERROR: ngrok crashed on startup — log:"
+            Get-Content "C:\ngrok\ngrok.log" -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "ngrok alive — polling API"
         shell: powershell
 
-      - name: Set Auth
-        run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
-        shell: powershell
-
-      - name: Set Password
-        run: Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "P@ssw0rd!" -Force)
-        shell: powershell
-
-      # Run ngrok in the background — foreground blocks and never prints the address
-      - name: Create Tunnel
-        run: Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -NoNewWindow
-        shell: powershell
-
-      # Poll until ngrok API responds then print the address
       - name: Get Address
         run: |
           $url = $null
@@ -76,12 +83,12 @@ jobs:
             Write-Host "  PASSWORD    : P@ssw0rd!"
             Write-Host "=========================================="
           } else {
-            Write-Host "Tunnel never came up"
+            Write-Host "Tunnel never came up — ngrok log:"
+            Get-Content "C:\ngrok\ngrok.log" -Tail 30 -ErrorAction SilentlyContinue
             exit 1
           }
         shell: powershell
 
-      # Hold the session open
       - name: Keep Alive
         run: Start-Sleep -Seconds 21600
         shell: powershell
